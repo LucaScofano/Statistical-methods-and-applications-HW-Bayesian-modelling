@@ -1,0 +1,734 @@
+---
+title: "Rain Project"
+author: "Luca"
+date: "August 31, 2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r, include=FALSE}
+# Load packages needed
+
+library(dplyr)# Transform values from 'Yes' to 1 and 'No' to 0
+library(ggplot2)# Data Visualization library
+library(R2jags)# Used to create Bayesian Statistical Models
+library(viridis)# Different colours for plots
+library(corrplot)# Correlation plot visualization
+library(nimble)# Double exponential
+library(rjags)# Used for the Bayesian Model
+#install.packages("runjags", dependencies = TRUE, repos = "http://cran.us.r-project.org")
+#install.packages("superdiag", dependencies = TRUE, repos = "http://cran.us.r-project.org")
+library(superdiag)# library used for an all-in-one diagnostics
+#install.packages("ggmcmc", dependencies = TRUE, repos = "http://cran.us.r-project.org")
+library(ggmcmc)#library used to plot MCMC's density functions
+library(dplyr)# Transform values from 'Yes' to 1 and 'No' to 0
+library(ggplot2)# Data Visualization library
+library(R2jags)# Used to create Bayesian Statistical Models
+library(viridis)# Different colours for plots
+library(corrplot)# Correlation plot visualization
+library(nimble)# Double exponential
+library(rjags)# Used for the Bayesian Model
+#install.packages("runjags", dependencies = TRUE, repos = "http://cran.us.r-project.org")
+#install.packages("superdiag", dependencies = TRUE, repos = "http://cran.us.r-project.org")
+library(superdiag)# library used for an all-in-one diagnostics
+#install.packages("ggmcmc", dependencies = TRUE, repos = "http://cran.us.r-project.org")
+library(ggmcmc)#library used to plot MCMC's density functions
+library(LaplacesDemon)
+# library(knitr)
+# library(kableExtra)
+library(gridExtra)
+```
+
+
+## 1. Load Data
+
+This dataset contains daily weather observations from numerous Australian weather stations.
+
+The target variable RainTomorrow means: Did it rain the next day? Yes or No. 
+
+```{r}
+data <- read.table("C:\\Users\\Luca\\Desktop\\SDS 2 Project\\Data\\weatherAUS.csv", 
+                   sep = ",", header = T, fill = T)
+
+
+head(data)
+dim(data)
+
+# Delete NaN values
+clean_data = na.omit(data)
+dim(clean_data)
+
+# Analyze the variables involved
+str(clean_data)
+```
+
+
+## 2. Feauture Selection & Data Analysis
+
+As we can read on the dataset's documentation we should remove the feauture RISK_MM.
+This variable shows the amount of next day rain in mm (millimetre) and not excluding it will leak the answers to your model and reduce its predictability. It's highly correlated to the target value, and thus we'll drop it. 
+Looking at variables we can see that they are made up by different data types, we'll drop some of them like **Location** and others should be converted from string to boolean when we find "Yes" and "No", like **RainToday** and **RainTomorrow**.
+
+```{r}
+clean_data$RISK_MM <- NULL
+
+# We would like to transform two variables from character to Boolean
+# Yes --> 1 and No --> 0
+
+clean_data <- clean_data %>%
+  mutate(RainToday = ifelse(RainToday == "No",0,1))
+
+clean_data <- clean_data %>%
+  mutate(RainTomorrow = ifelse(RainTomorrow == "No",0,1))
+
+str(clean_data)
+```
+
+
+### What is the year with the most rainy days?
+
+Before we delete the feauture **Date** we should use it to perform some Exploratory Data Analysis.
+
+```{r, warning = FALSE}
+clean_data$Date <- as.Date(clean_data$Date) 
+# Subset of the data formed only by rainy days
+newdata <- subset(clean_data, clean_data$RainToday == 1)
+ggplot(newdata, aes(format(newdata$Date, "%Y"))) +
+  geom_bar(stat = "count") +
+  labs(x = "Year")
+
+clean_data$Date <- NULL
+```
+In 2010, Australia experienced its third-wettest year since national rainfall records began in 1900
+
+### Which is the location where it rained the most days?
+```{r, warning = FALSE}
+ggplot(newdata, aes(format(newdata$Location))) +
+  geom_bar(stat = "count") +
+  labs(x = "Location")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+```{r}
+clean_data$Location <- NULL
+
+# Other variables that can't be converted to numeric
+clean_data$WindGustDir <- NULL
+clean_data$WindDir3pm <- NULL
+clean_data$WindDir9am <- NULL
+```
+
+
+
+### Correlation plot
+
+This correlation plot shows us that some variables are higly correlated to each other. This is not great news, since they'll compete to explain the Y variable, we'll later delete some of these after we see some more proof.
+```{r}
+knitr::opts_chunk$set(fig.width=12, fig.height=8)
+par(mfrow = c(1,1))
+correlations <- cor(clean_data)
+corrplot(correlations, method="circle")
+```
+
+### Plots of feautures vs response variable
+```{r}
+attach(clean_data)
+#knitr::opts_chunk$set(fig.width=0.5, fig.height=0.5)
+colors = viridis(18, alpha = 0.99)
+
+columns <- colnames(clean_data)
+
+par(mfrow = c(3,3))
+
+j = 1 
+for(i in columns){
+  
+  if(i=="Cloud9am" || i=="Cloud3pm" || i=="RainToday" || i=="RainTomorrow") next
+
+  
+  boxplot(clean_data[[i]] ~ RainTomorrow , 
+       data = clean_data, col = colors[j], xlab = "Rain Tomorrow",         ylab = i)
+  j <- j + 1
+  
+}
+
+```
+
+
+## 3. To do list:
+
+We have a couple of steps to follow before creating the model:
+
+* 3.1 Normalize X's (subtracting the mean and dividing by the SD)
+* 3.2 Skimming through variables
+* 3.3 Description of the diagnostics we'll perform
+
+### 3.1 Normalization
+
+```{r}
+
+# Standardize variables
+index <- sample(1:nrow(clean_data), 10000) # We are going to take 20.000 samples out of the initial dataset
+new_data <- clean_data[index,]
+
+# We are going to scale continous values by subtracting the mean and dividing by the SD
+X = scale(new_data[,-18],center = TRUE, scale = TRUE)
+```
+
+```{r}
+y = new_data$RainTomorrow # Target variable
+X = na.omit(X) # Delete all Nan values (double checking)
+```
+
+$y_{i}$ is a Bernoulli outcome [0,1], we are going to use a logarithmic scale as a link function that relates the linear form of the restricted parameter to a [0,1] interval. We need to find the probability of success, by doing this we need to apply Bayesian Methods. 
+
+**Main Ingredients: **
+\begin{center}
+$Likelihood = (y_{i}|\phi ) \sim Bern(\phi_{i})$
+\end{center}
+
+Since $\phi$ is the probability of success (Tomorrow it will rain), then:
+
+\begin{center}
+$E(\phi_{i}) = p$
+\end{center}
+
+\begin{center}
+$E(yi) = \beta_0 + \beta_1x_1 + ... + \beta_nx_n$
+\end{center}
+
+We need to use the link function that relates the linear form of the restricted parameter and allow us to have our $\phi\epsilon$ [0, 1]. Thus:
+
+\begin{center}
+$logit(\phi_i) = log\frac{\phi}{(1-\phi)} = \beta_0 + \beta_1x_1 + ... + \beta_nx_n$
+\end{center}
+
+If we use some algebra we can rewrite these equations as:
+
+\begin{center}
+$logit(\phi_i) = \beta_0 + \beta_1x_1 + ... + \beta_nx_n \Rightarrow \phi_i = \frac{e^{\beta_0 + \beta_1x_1 + ... + \beta_nx_n}}{1 + e^{\beta_0 + \beta_1x_1 + ... + \beta_nx_n}}$
+\end{center}
+
+At the end we can rewrite this as: 
+
+\begin{center}
+$\phi_i = \frac{1}{1 + e^{-(\beta_0 + \beta_1x_1 + ... + \beta_nx_n)}}$
+\end{center}
+
+**Visualization of different distributions**
+
+Since we are going to use two different models, with two different prior distributions, I would like to show two generic plots of these distributions.
+
+```{r}
+# Visualize double exponential function
+f <- function(x){ddexp(x)}
+g <- function(x){dnorm(x)}
+curve(f(x),xlim = c(-3,3),ylim=c(0,0.6),col = 'dark green')
+curve(g(x),add = T,xlim = c(-3,3),ylim=c(0,0.6),col = 'red')
+# Add a legend
+legend("topleft", legend = c("Double Exponential", "Normal"), 
+  col = c('dark green', 'red'), lty=1)
+```
+The plot points out the main difference of a Normal distribution and a double exponential one. Both are higly concentrated on 0, but the double exponential one has heavier tails and is more concentrated on 0.
+
+### 3.2 Feature selection
+
+Now we can create the model -> GLM (Generalized linear model) and we are going to pick family = LOGIT.
+
+```{r}
+glm.fit <- glm(y ~ X[,1] + X[,2] + X[,3] + X[,4] + X[,5]+
+                 X[,6] + X[,7]+X[,8]+X[,9]+X[,10]+X[,11]+
+                 X[,12]+X[,13]+X[,14]+X[,15]+X[,16], family =
+                 'binomial'(link="logit"), maxit = 50)
+
+summary(glm.fit)
+```
+
+This is a first skimming of some variables, from now on we'll only keep the ones that influece the response variable.
+
+
+### 3.3 Diagnostics we are going to use
+
+* **Trace & Density plot:**
+The target of this plot is to show random scatter around the mean value, and our model results suggest that the chains mixed well and the traceplot looked satisfactory. One reason for running multiple chains is that any individual chain might converge toward one target, while another chain might converge elsewhere and this would still be a problem. Also, you might see healthy chains getting stuck over the course of the series, which might suggest more model tweaking or a change in the sampler settings is warranted. The density plots are used as a graphical assessment for the coefficients. The goal is to have normally distributed random variables with posterior mean different from 0, otherwise this signifies that our data didn't give us additional information than the one we had with the prior double exponential one (centered in 0).
+
+
+* **Autocorrelation:**
+This plots shows us for each lag the correlation between the current one and the previous one.
+The goal is to have a plot that drops as soon as possible, the sooner it is the less iterations we need for our MCMC.
+We could double check this with the effective sample size, it's the number of independet observations our sample is equivalent to.
+The greater the correlation between observations, the smallest the effective sample size will be.
+
+
+* **Gelman Rubin:**
+It uses different starting values that are overdispersed relative to the posterior distribution. Convergence is diagnosed when the chains have "forgotten" their initial values, and the output from all chains is indistringuishable, in other words all chains should have the dame distribution.
+It is based on comparison of within chain and between chain variance and what we want is less between chain rather than within, this means we got to a convergence point. Analytically:
+
+We have $M$ chains of length $N$ and a parameter $\phi$. For each chain we have $\left \{ \phi_{mt} \right \}_{t=1}^{N}$ where:
+
+\begin{center}
+$\hat{\phi_m} =  Posterior \ Mean$ 
+\end{center}
+
+\begin{center}
+$\hat{\sigma^2}= Posterior Variance$ 
+\end{center}
+
+\begin{center}
+At this point we can compute the overall Posterior Mean = $\hat{\phi}=\frac{1}{M}\sum_{n=1}^{M}\hat{\phi_m}$
+\end{center}
+
+We need all of these ingredients to compute the **Between** Variance and **Within** Variance of each chain in order to obtain the **Pooled Variance**:
+
+\begin{center}
+Between variance = $B = \frac{N}{M-1}\sum_{m=1}^{M}(\hat{\phi_m}-\hat{\phi})^2$
+\end{center}
+
+\begin{center}
+Within variance = $W = \frac{1}{M}\sum_{m=1}^{M}\hat{\sigma^2_m}$
+\end{center}
+
+\begin{center}
+Pooled Variance = $\hat{V} = \frac{N-1}{N}W+\frac{M+1}{MN}B$
+\end{center}
+
+This was the second-last step performed by this algorithm, now the only thing left is to compute the ration between $\hat{V}$ and $W$. If this ration is close to 1 (not more than 1.1), then we've obtained convergence.
+
+
+
+* **Heidelberg-Welch:**
+It's based on the assumption that we have got a **weakly stationary process** when the chain has reached convergence. This means that:
+
+\begin{center}
+$E[x_j]$ is constant throughout time
+\end{center}
+
+\begin{center}
+$Cov(\phi^j, \phi^{j+s})$ does not depend on j
+\end{center}
+
+This diagnostic not only tells us whether the MCMC converged, but also if we had run the chain enough times. The first part tests a null hypothesis that the sampled values of the chain come from a stationary distribution. If the hypothesis is rejected than we discard the first 10%, then 20%, until either the null hypothesis is accepted or 50% of the chain has been discarded. If the stationary test is passed, the number of iterations to keep and the number to discard are reported.
+
+Then we pass to the second part, half width test. It will tell us if we can estimate the mean with some level of accuracy. We compute the ratio of the margin of error (Halfwidth/Mean)and compare it to the estimated mean. If the ration is less than epsilon (usually 0.1) than the test is passed, otherwise we should extend the chain because we aren't able to estimate the mean.
+
+
+* **Raftery:**
+This test has to approve a couple of conditions. We would like to compute a posterior quantile **q** with some tollerance **r** (+ or -). We then pick a probability **s** which is the probability of being within the interval **(q-r, q+r)**.
+This diagnostic test estimates the number N of iterations and the number of burn-in iterations that are necessary in order to satisfy these two conditions.
+
+\begin{center}
+$z = \frac{\bar{\phi_a}-\bar{\phi_b}}{\sqrt{Var(\phi_a)-Var(\phi_b)}}$
+\end{center}
+
+where **a = initial interval and b = late interval** and z should fall within two standard deviation of zero.
+
+* **Geweke:**
+Compare the estimate of the mean of the first part of the chain with the last part of the chain. By default the first part is 10% and the latter part is 50%. If they come from the same stationary distribution then the mean should be equal and the Geweke's statistics has an asymptotically standard normal distribution. This will produce a test statistics, if this passes we should get a value between -2 and +2 (this means that the chain has converged to its stationary distribution)
+
+## 4 Model n.1 using Normal prior (RIDGE)
+
+This model shows us the first part that corresponds to the likelihood function and we'll use a Bernoulli distribution to model y[i]. We won't model directly the prob of success = p[i], but the logit of that function, get's the linear part of the function. We'll use a non informative prior that is a Normal with mean = 0 and SD = 0.00010. 
+
+We are going to use three different chains to check wether they all converge to a stable solution.
+
+```{r}
+# Let's write down the model
+inits_0 = list("int" = 0.2, 'lambda' = 0.2, 'b' = rep(0.1,10))
+inits_1 = list("int" = 0.15, 'lambda' = 0.15, 'b' = rep(0.05,10))
+inits_2 = list("int" = 0.25, 'lambda' = 0.25, 'b' = rep(0.2,10))
+inits_total1 = list(inits_0,inits_1,inits_2)
+
+mod1_string = "model{
+
+  for (i in 1:length(y)){
+    y[i] ~ dbern(p[i])
+    
+    logit(p[i]) = int + b[1]*Evaporation[i] + b[2]*Sunshine[i] + b[3]*WindGustSpeed[i] + b[4]*WindSpeed9am[i] +     b[5]*Humidity9am[i] + b[6]*Humidity3pm[i] + b[7]*Pressure9am[i] + b[8]*Pressure3pm[i] + b[9]*Cloud9am[i] + b[10]*Temp3pm[i]
+  }
+
+  int ~ dnorm(0.0,1.0E-6)
+
+  for (j in 1:10){
+    b[j] ~ dnorm(0.0,lambda) # prior,has variance 1
+  }
+  lambda ~ dgamma(0.1,0.1)
+
+}"
+
+set.seed(123)
+data_jags = list(y = new_data$RainTomorrow,
+                 Evaporation = X[,4],
+                 Sunshine = X[,5],
+                 WindGustSpeed = X[,6],
+                 WindSpeed9am = X[,7],
+                 Humidity9am = X[,9],
+                 Humidity3pm = X[,10],
+                 Pressure9am = X[,11],
+                 Pressure3pm = X[,12],
+                 Cloud9am = X[,13],
+                 Temp3pm = X[,16])
+
+params = c('int','b','lambda')
+mod1 = jags(data = data_jags, inits = inits_total1,
+            parameters.to.save = params, model.file = textConnection(mod1_string),n.chains = 3,
+            n.iter = 9000)
+# The function `mcmc' is used to create a Markov Chain Monte Carlo object.
+mod1_sim = as.mcmc(mod1)
+options(scipen=999)
+```
+
+```{r}
+mod1$BUGSoutput$summary
+```
+
+
+### Feauture selection with Confidence Intervals
+
+ One suggested method for doing that exploits the use of the credible intervals of the posterior of the $\beta_i$: if, for a fixed level $\alpha$, the interval contains 0, then the coefficients should be excluded. Generally, the author of the paper noted that the usual sets of $\alpha$ are too large for the variable selection and would exclude too many $\beta_i$. It is instead suggested an $\alpha$ of $0.5$.
+
+```{r, echo=FALSE}
+cols <- viridis(4)
+posterior_df <- data.frame(mod1_sim[[1]])
+posterior_df <- posterior_df[lapply(posterior_df,length)>0]
+
+par(mfrow = c(2,3))
+
+ci_beta_1 <- p.interval(posterior_df$b.1.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.1.), col = cols[1], lwd = 4, main = ~beta[1])
+abline(v = c(ci_beta_1[1], ci_beta_1[2]), col = cols[3], lwd = 4)
+
+ci_beta_2 <- p.interval(posterior_df$b.2.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.2.), col = cols[1], lwd = 4, main = ~beta[2])
+abline(v = c(ci_beta_2[1], ci_beta_2[2]), col = cols[3], lwd = 4)
+
+ci_beta_3 <- p.interval(posterior_df$b.3.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.3.), col = cols[1], lwd = 4,main = ~beta[3])
+abline(v = c(ci_beta_3[1], ci_beta_3[2]), col = cols[3], lwd = 4)
+
+ci_beta_4 <- p.interval(posterior_df$b.4.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.4.), col = cols[1], lwd = 4, main = ~beta[4])
+abline(v = c(ci_beta_4[1], ci_beta_4[2]), col = cols[3], lwd = 4)
+
+ci_beta_5 <- p.interval(posterior_df$b.5.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.5.), col = cols[1], lwd = 4, main = ~beta[5])
+abline(v = c(ci_beta_5[1], ci_beta_5[2]), col = cols[3], lwd = 4)
+
+ci_beta_6 <- p.interval(posterior_df$b.6.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.6.), col = cols[1], lwd = 4, main = ~beta[6])
+abline(v = c(ci_beta_6[1], ci_beta_6[2]), col = cols[3], lwd = 4)
+
+ci_beta_7 <- p.interval(posterior_df$b.7.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.7.), col = cols[1], lwd = 4, main = ~beta[7])
+abline(v = c(ci_beta_7[1], ci_beta_7[2]), col = cols[3], lwd = 4)
+
+ci_beta_8 <- p.interval(posterior_df$b.8.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.8.), col = cols[1], lwd = 4, main = ~beta[8])
+abline(v = c(ci_beta_8[1], ci_beta_8[2]), col = cols[3], lwd = 4)
+
+ci_beta_9 <- p.interval(posterior_df$b.9.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.9.), col = cols[1], lwd = 4, main = ~beta[9])
+abline(v = c(ci_beta_9[1], ci_beta_9[2]), col = cols[3], lwd = 4)
+
+ci_beta_10 <- p.interval(posterior_df$b.10.,HPD = F, prob = 0.5, plot = F)
+plot(density(posterior_df$b.10.), col = cols[1], lwd = 4, main = ~beta[10])
+abline(v = c(ci_beta_10[1], ci_beta_10[2]), col = cols[3], lwd = 4)
+
+```
+
+
+### Trace & Density plots 
+
+- Humidity3pm (Beta 7)
+- Pressure9am (Beta 8)
+- Pressure3pm (Beta 9)
+- Cloud9am (Beta 10)
+- Temp3pm (Beta 11)
+
+All of the variables listed above show some autocorrelation, as we can see in the traceplot and the density plot as well. They all have mean close to 0, this means that they won't help us predicting Y_i observations. For the second model I decided to drop these variables and keep the most significant ones.
+
+```{r}
+plot.new()
+par(mfrow = c(3,4))
+plot(mod1_sim)
+```
+
+## Diagnostics
+
+```{r}
+superdiag(mod1_sim, burnin = 100)
+```
+
+* **Gelman & Rubin:**
+To detect whether they've hit the target distribution. We are looking for a value near 1 (and at the very least less than 1.1).
+
+* **Geweke**
+All chains have converged to a stationary distribution.
+
+* **Raftery**
+
+* **Heidelberg-Welch**
+This diagnostic tells us what we already know, all of the variables listed previously haven't passed the halfwidth mean test, this means that for convergence to occur we need to extend the iterations.
+
+### Density functions MCMC
+Double check that the variables that we pointed out are concentrated on 0.
+```{r, fig.width=10,fig.height=15}
+# All in one diagnostics
+bayes.mod.fit.gg <- ggs(mod1_sim)
+ggs_density(bayes.mod.fit.gg)
+```
+
+### Autocorrelation
+```{r}
+# As noted previously, each estimate in the MCMC process is serially correlated 
+# with the previous estimates by definition. Higher serial correlation typically has the effect of requiring 
+# more samples in order to get to a stationary distribution.
+autocorr.diag(mod1_sim)
+effectiveSize(mod1_sim)
+mod1$BUGSoutput$DIC
+
+
+results1=ggs(mod1_sim)
+ggs_running(results1)
+ggs_autocorrelation(results1)
+```
+
+
+## 5. Model n.2 using Double Exponential prior (LASSO)
+Now we are going to create a prior using the double exponential probabilty distribution. Not only that, but we are going to use only the variables that are significant, this means we'll delete the ones that were distributed with a mean around 0. The variables that have been dropped are:
+
+- Humidity3pm (Beta 7)
+- Pressure9am (Beta 8)
+- Pressure3pm (Beta 9)
+- Cloud9am (Beta 10)
+- Temp3pm (Beta 11)
+
+```{r}
+
+# Let's write down the model
+inits_0 = list("int" = 0.2, 'lambda' = 0.2, 'b' = rep(0.1,5))
+inits_1 = list("int" = 0.15, 'lambda' = 0.15, 'b' = rep(0.05,5))
+inits_2 = list("int" = 0.25, 'lambda' = 0.25, 'b' = rep(0.2,5))
+inits_total2 = list(inits_0,inits_1,inits_2)
+
+# Variables
+data_jags2 = list(y = new_data$RainTomorrow,
+                 Evaporation = X[,4],
+                 Sunshine = X[,5],
+                 WindGustSpeed = X[,6],
+                 WindSpeed9am = X[,7],
+                 Humidity9am = X[,9])
+
+mod2_string = "model{
+  for (i in 1:length(y)){
+
+y[i] ~ dbern(p[i])
+
+logit(p[i])= int +
+    b[1]*Evaporation[i] + b[2]*Sunshine[i] + b[3]*WindGustSpeed[i] + b[4]*WindSpeed9am[i] + b[5]*Humidity9am[i]
+  }
+
+int ~ dnorm(0.0,1.0E-6)
+
+for (j in 1:5){
+b[j] ~ ddexp(0.0,lambda)
+}
+lambda ~ dgamma(0.1,0.1)
+}"
+
+
+
+params = c('int','b','lambda')
+mod2 = jags(data = data_jags2, inits = inits_total2,
+            parameters.to.save = params,model.file = textConnection(mod2_string),n.chains = 3,
+            n.iter = 9000)
+
+mod2_sim = as.mcmc(mod2)
+options(scipen=999)
+```
+
+```{r}
+mod2$BUGSoutput$summary
+```
+
+### Trace & Density plots 
+Once we've dropped the variables that were not explanatory we can see that the rest are valuable and all tend to converge to a stationary distribution (graphically seen in the traceplot)
+```{r}
+plot.new()
+par(mfrow = c(3,4))
+plot(mod2_sim)
+```
+
+### Diagnostics
+
+```{r}
+superdiag(mod2_sim, burnin = 100)
+```
+
+
+All of the diagnostics give us the same result, convergence to a stationary distribution. In this case even the Heidelberg-Welch diagnostics gives us positive outcomes for both Stationary start and Halfwidth Mean.
+
+### Density functions MCMC
+```{r, fig.width=10,fig.height=15}
+bayes.mod.fit.gg <- ggs(mod2_sim)
+ggs_density(bayes.mod.fit.gg)
+```
+
+
+### Autocorrelation
+```{r}
+autocorr.diag(mod2_sim)
+effectiveSize(mod2_sim)
+mod2$BUGSoutput$DIC
+
+
+results2=ggs(mod2_sim)
+ggs_running(results2)
+ggs_autocorrelation(results2)
+```
+
+## 6. Prediction
+
+```{r}
+XT = X
+```
+
+
+```{r}
+mod_csim = as.mcmc(do.call(rbind,mod1_sim))
+posterior_coef = colMeans(mod_csim)
+posterior_coef_list = c(posterior_coef[6], posterior_coef[7], posterior_coef[8], posterior_coef[9], posterior_coef[11])
+predicted = posterior_coef['int'] + XT[,c(4, 5, 6, 7, 9)] %*% posterior_coef_list
+p_hat = 1.0/(1.0 + exp(-predicted))
+tab0.5a = table(p_hat > 0.4, y)
+performance_mod1 = sum(diag(tab0.5a))/sum(tab0.5a)
+var_mod1 = mean((p_hat - y)^2)
+```
+
+```{r}
+mod2_csim = as.mcmc(do.call(rbind,mod2_sim))
+mod2_csim =as.matrix(mod2_csim)
+posterior_coef2 = colMeans(mod2_csim)
+predicted2 = posterior_coef2['int'] + XT[,c(4, 5, 6, 7, 9)] %*% posterior_coef2[1:5]
+p_hat2 = 1.0/(1.0 + exp(-predicted2))
+tab0.5b = table(p_hat2 > 0.4, y)
+performance_mod2 = sum(diag(tab0.5b))/sum(tab0.5b)
+var_mod2 = mean((p_hat2 - y)^2)
+```
+
+
+
+```{r}
+predicted.data <- data.frame(
+  p = p_hat,
+  rain = y
+)
+predicted.data <- predicted.data[
+  order(predicted.data$p,decreasing = FALSE),]
+predicted.data$rank <- 1:nrow(predicted.data)
+
+predicted.data3 <- data.frame(
+  p = p_hat2,
+  rain = y
+)
+predicted.data3 <- predicted.data3[
+  order(predicted.data3$p,decreasing = FALSE),]
+predicted.data3$rank <- 1:nrow(predicted.data3)
+
+# Frequentist analysis (2, 4, 5, 6, 7, 9)
+glm.fit <- glm(y ~ X[,4] + X[,5]+X[,6]+X[,7]+X[,9],
+               family = 'binomial'(link="logit"), maxit = 50)
+### The model doesn't have Rain Tomorrow variable
+summary(glm.fit)
+
+# Frequentist prediction
+coef_freq = summary(glm.fit)$coefficients[,1]
+freq_predicted = coef_freq ['(Intercept)'] + XT[,c(4, 5, 6, 7, 9)] %*% coef_freq [2:6]
+p_hat_freq = 1.0/(1.0 + exp(-freq_predicted))
+tab0.5c = table(p_hat_freq > 0.5, y)
+performance_freq = sum(diag(tab0.5c))/sum(tab0.5c)
+var_freq = mean((p_hat_freq - y)^2)
+predicted.data2 <- data.frame(
+  p = p_hat_freq,
+  rain = y
+)
+predicted.data2 <- predicted.data2[
+  order(predicted.data2$p,decreasing = FALSE),]
+predicted.data2$rank <- 1:nrow(predicted.data2)
+
+# Main results
+
+print(tab0.5a)
+print(tab0.5b)
+print(tab0.5c)
+
+
+cat('variance of model 1:',var_mod1,
+    'variance of model 2:',var_mod2,
+    'variance of model freq:',var_freq,fill = 2)
+
+cat('performance of model 1:',performance_mod1,
+    'performance of model 2:',performance_mod2,
+    'performance of model freq:',performance_freq,fill = 2)
+
+print(mod1$BUGSoutput$DIC)
+print(mod2$BUGSoutput$DIC)
+print(extractAIC(glm.fit))
+
+
+```
+
+
+## 7.Models comparison
+
+A good model comparison criterion to choose may be the DIC (Deviance Information Criterion). 
+The DIC penalty term is based on a complexity term that measures the difference
+between the expected log likelihood and the log likelihood at the posterior mean point. 
+It is designed specifically for Bayesian estimation that involves MCMC simulations. 
+
+
+DIC is based on the deviance statistics
+
+\begin{center}
+$C = logf^*(y|\theta^*)$
+$D(\theta) = -2logf(y|\theta) + C$
+\end{center}
+
+where: $f(.|.)$ is the likelihood function of the model and $f^*(y|\theta^*)$ is the likelihood of the full model that fits
+data perfectly. 
+
+Because C is constant across models fit to the same data, it is ignored in the actual calculation of DIC.
+
+In the end, the DIC is a sum of two components: the goodness-of-fit term $D(\theta)$ and the model complexity term $p_D$ 
+
+\begin{center}
+$DIC = D(\bar{\theta}) + 2p_D$
+\end{center}
+
+where:
+
+\begin{itemize}
+\item $D(\bar{\theta}) = D[E(\theta)]$ ;
+\item $p_D = E_\theta[D(\theta)] - D(E[\theta])$
+\end{itemize}
+
+$p_D$ is the complexity of the model (equivalent to the effective number of parameters) and it is defined as
+the difference between the expected deviance (the larger it is, the worse is the fit) and the deviance of fitted
+values. That is, the more complex the model is, the larger $p_D$ will be and that is a sign of overfitting.
+
+So, since lower deviance means a model that better fits the data, models with smaller DIC should be preferred to models with larger DIC.
+
+The DIC is easily computed from samples generated by a Monte Carlo Markov Chain simulation and we already have it from the previous outputs:
+
+
+```{r}
+print(c("Model 1:",mod1$BUGSoutput$DIC))
+```
+
+```{r}
+print(c("Model 2:",mod2$BUGSoutput$DIC))
+```
+
+
+Hence, the first model seems to be the best one since the DIC value is lower and, as we could see previously,
+it also converges with less iterations with respect to the first model. Thus, we are going to prefer this one.
